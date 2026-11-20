@@ -7,10 +7,10 @@ human-readable transcript so the same flow can be replayed from the UI or from
 from __future__ import annotations
 
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Callable
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -442,12 +442,405 @@ def scenario_rule_revision_full_period(db: Session) -> list[Step]:
     return steps
 
 
+# --------------------------------------------------------------------------
+# baseline-uncertainty scenarios
+# --------------------------------------------------------------------------
+def _report_for(db: Session, run_id: int, customer_id: int, event_id: int) -> models.UncertaintyReport | None:
+    return db.scalars(
+        select(models.UncertaintyReport).where(
+            models.UncertaintyReport.run_id == run_id,
+            models.UncertaintyReport.customer_id == customer_id,
+            models.UncertaintyReport.event_id == event_id,
+        )
+    ).first()
+
+
+def _baseline_node(db: Session, run_id: int, customer_id: int, event_id: int) -> models.Node | None:
+    return db.scalars(
+        select(models.Node).where(
+            models.Node.run_id == run_id,
+            models.Node.customer_id == customer_id,
+            models.Node.event_id == event_id,
+            models.Node.node_type == "baseline",
+        )
+    ).first()
+
+
+def _pseudo_rows(report: models.UncertaintyReport) -> list[dict]:
+    rows = (report.report or {}).get("samples", {}).get("eligibility", [])
+    return [row for row in rows if row.get("pseudo")]
+
+
+def _register_demo_customer(
+    db: Session,
+    *,
+    code: str,
+    name: str,
+    region: str,
+    meter_no: str,
+    capacity_kw: float,
+    day_kwh,
+    first_day: date,
+    last_day: date,
+) -> models.Customer:
+    """Register a demo customer with meter, contract and daily batches."""
+    customer = models.Customer(code=code, name=name, region=region, contact="联调演示")
+    db.add(customer)
+    db.flush()
+    db.add(
+        models.ContractVersion(
+            customer_id=customer.id,
+            version=1,
+            capacity_kw=capacity_kw,
+            price_ceiling=4.0,
+            effective_from=date(2025, 1, 1),
+            reason="联调演示签约",
+            created_by="planner",
+        )
+    )
+    meter = models.MeterPoint(customer_id=customer.id, meter_no=meter_no, name=f"{name} 计量点")
+    db.add(meter)
+    db.flush()
+    day = first_day
+    while day <= last_day:
+        intervals = []
+        start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+        for j in range(96):
+            intervals.append({"ts": (start + timedelta(minutes=15 * j)).isoformat(), "kwh": day_kwh(day, j)})
+        registry.ingest_batch(
+            db,
+            {"batch_key": f"{meter_no}-{day.isoformat()}", "meter_no": meter_no, "intervals": intervals},
+            "planner",
+        )
+        day += timedelta(days=1)
+    db.commit()
+    return customer
+
+
+def scenario_uncertainty_calibration(db: Session) -> list[Step]:
+    steps: list[Step] = []
+    run = orchestrator.create_run(db, actor="planner", period_month=DEMO_PERIOD, strategy="initial")
+    steps.append(
+        _step("整期运行成功", run.status == PASS, {"run_code": run.run_code, "status": run.status})
+    )
+    reports = db.scalars(
+        select(models.UncertaintyReport).where(models.UncertaintyReport.run_id == run.id)
+    ).all()
+    steps.append(
+        _step(
+            "每个客户活动窗口均生成不确定度报告",
+            len(reports) == 18,
+            {"reports": len(reports), "windows": run.target_windows},
+        )
+    )
+    node_count = db.scalar(select(func.count()).select_from(models.Node).where(models.Node.run_id == run.id))
+    steps.append(
+        _step("每窗口 5 个节点（含 uncertainty 旁路）", node_count == 18 * 5, {"nodes": node_count})
+    )
+
+    event_days = {e.event_date for e in db.scalars(select(models.Event)).all()}
+    label_ok = True
+    leakage_ok = True
+    for report in reports:
+        for row in _pseudo_rows(report):
+            day = date.fromisoformat(row["day"])
+            if day in event_days:
+                label_ok = False
+            pseudo = row["pseudo"]
+            if row["day"] not in pseudo["excluded_days"] or not pseudo["leakage_window"]:
+                leakage_ok = False
+    steps.append(
+        _step(
+            "伪活动日残差全部来自非活动日（实际活动日负荷从不作误差标签）",
+            label_ok,
+            {"event_days": sorted(d.isoformat() for d in event_days)},
+        )
+    )
+    steps.append(_step("每个伪活动日均排除目标日及泄漏窗口", leakage_ok, None))
+
+    interval_ok = True
+    method_ok = True
+    refs_ok = True
+    degraded_map: dict[str, int] = {}
+    for report in reports:
+        detail = report.report or {}
+        degraded_map[report.status] = degraded_map.get(report.status, 0) + 1
+        interval = detail.get("interval")
+        if interval is None or report.baseline_kwh is None:
+            interval_ok = False
+        else:
+            if not (interval["lower_kwh"] <= float(report.baseline_kwh) <= interval["upper_kwh"]):
+                interval_ok = False
+            if interval["relative_width"] is None or interval["relative_width"] > 0.5:
+                interval_ok = False
+        methods = detail.get("methods", {})
+        holdout = methods.get("holdout") or {}
+        bootstrap = methods.get("block_bootstrap") or {}
+        if holdout.get("interval") is None or bootstrap.get("interval") is None:
+            method_ok = False
+        if bootstrap.get("replicates") != 200:
+            method_ok = False
+        width = detail.get("width_components") or {}
+        if width.get("residual_noise_kwh") is None or width.get("final_half_width_kwh") is None:
+            method_ok = False
+        refs = report.input_refs or {}
+        if refs.get("rule_version") != 1 or not refs.get("cutoff_at") or not refs.get("batch_ids"):
+            refs_ok = False
+    steps.append(
+        _step("区间包含基线值且相对宽度 ≤50%", interval_ok, {"status分布": degraded_map})
+    )
+    steps.append(
+        _step("留出法与块重采样双方法产出区间，宽度来源分解齐全", method_ok, None)
+    )
+    steps.append(_step("报告引用同一锁定规则与输入版本", refs_ok, None))
+    return steps
+
+
+def scenario_uncertainty_flat_load(db: Session) -> list[Step]:
+    steps: list[Step] = []
+    customer = _register_demo_customer(
+        db,
+        code="C-901",
+        name="平稳负荷示范户",
+        region="高新区",
+        meter_no="M901-01",
+        capacity_kw=2000.0,
+        day_kwh=lambda _day, _slot: 40.0,
+        first_day=date(2025, 7, 20),
+        last_day=date(2025, 8, 22),
+    )
+    steps.append(_step("登记负荷恒定的示范客户（40 kWh/区间）", True, {"customer_id": customer.id}))
+    event = _event(db, "DR-20250820")
+    run = orchestrator.create_run(
+        db, actor="planner", period_month=DEMO_PERIOD, strategy="initial", event_id=event.id
+    )
+    report = _report_for(db, run.id, customer.id, event.id)
+    steps.append(_step("运行完成且报告生成", report is not None, {"run_code": run.run_code}))
+    residuals = [row["pseudo"]["residual_kwh"] for row in _pseudo_rows(report)]
+    max_abs = max((abs(r) for r in residuals), default=None)
+    steps.append(
+        _step(
+            "伪活动日残差≈0（平稳负荷）",
+            max_abs is not None and max_abs <= 0.01 and len(residuals) >= 15,
+            {"n_residuals": len(residuals), "max_abs_residual": max_abs},
+        )
+    )
+    interval = (report.report or {}).get("interval") or {}
+    steps.append(
+        _step(
+            "区间收窄且状态 ok",
+            report.status == "ok" and interval.get("half_width_kwh") is not None and interval["half_width_kwh"] <= 0.01,
+            {"status": report.status, "interval": interval},
+        )
+    )
+    return steps
+
+
+def scenario_uncertainty_holiday_exclusion(db: Session) -> list[Step]:
+    steps: list[Step] = []
+    holiday = registry.add_holiday(db, {"day": date(2025, 8, 19), "name": "联调示范假日（虚构）"}, "planner")
+    steps.append(
+        _step("在回看窗口内登记节假日", True, {"day": holiday.day.isoformat(), "name": holiday.name})
+    )
+    event = _event(db, "DR-20250820")
+    run = orchestrator.create_run(
+        db, actor="planner", period_month=DEMO_PERIOD, strategy="initial", event_id=event.id
+    )
+    customer = db.scalars(select(models.Customer).where(models.Customer.code == "C-001")).one()
+    baseline = _baseline_node(db, run.id, customer.id, event.id)
+    elig = {row["day"]: row for row in (baseline.output or {}).get("sample_eligibility", [])}
+    row = elig.get("2025-08-19")
+    steps.append(
+        _step(
+            "基线样本资格表保留 holiday 排除理由",
+            bool(row) and not row["eligible"] and "holiday" in row["reasons"] and not row["used"],
+            row,
+        )
+    )
+    steps.append(
+        _step(
+            "基线样本跳过节假日（4 天合格）",
+            (baseline.output or {}).get("sample_days") == 4,
+            {"sample_days": (baseline.output or {}).get("sample_days")},
+        )
+    )
+    report = _report_for(db, run.id, customer.id, event.id)
+    calib = {r["day"]: r for r in (report.report or {}).get("samples", {}).get("eligibility", [])}
+    calib_row = calib.get("2025-08-19") or {}
+    steps.append(
+        _step(
+            "伪活动日序列不含节假日",
+            not calib_row.get("eligible") and "holiday" in calib_row.get("reasons", []) and "pseudo" not in calib_row,
+            {"eligible": calib_row.get("eligible"), "reasons": calib_row.get("reasons")},
+        )
+    )
+    return steps
+
+
+def scenario_uncertainty_missing_weather(db: Session) -> list[Step]:
+    steps: list[Step] = []
+    event = _event(db, "DR-20250812")
+    run = orchestrator.create_run(
+        db, actor="planner", period_month=DEMO_PERIOD, strategy="initial", event_id=event.id
+    )
+    c003 = db.scalars(select(models.Customer).where(models.Customer.code == "C-003")).one()
+    c001 = db.scalars(select(models.Customer).where(models.Customer.code == "C-001")).one()
+    report = _report_for(db, run.id, c003.id, event.id)
+    weather = (report.report or {}).get("samples", {}).get("weather_coverage", {})
+    steps.append(
+        _step(
+            "云岭工业区（C-003）天气覆盖诊断为 missing",
+            weather.get("status") == "missing",
+            {"weather_coverage": weather},
+        )
+    )
+    detail = report.report or {}
+    steps.append(
+        _step(
+            "状态降级（degraded）但区间仍产出",
+            report.status == "degraded"
+            and "weather_missing" in detail.get("degraded_reasons", [])
+            and report.lower_kwh is not None
+            and report.upper_kwh is not None,
+            {"status": report.status, "reasons": detail.get("degraded_reasons")},
+        )
+    )
+    factor = (detail.get("width_components") or {}).get("weather_factor")
+    steps.append(
+        _step("覆盖因子按天气缺项放宽（≥1.25）", factor is not None and factor >= 1.25, {"weather_factor": factor})
+    )
+    other = _report_for(db, run.id, c001.id, event.id)
+    other_weather = (other.report or {}).get("samples", {}).get("weather_coverage", {})
+    steps.append(
+        _step(
+            "有气象数据的客户覆盖诊断正常",
+            other_weather.get("status") == "ok",
+            {"customer": "C-001", "weather_coverage": other_weather},
+        )
+    )
+    return steps
+
+
+def scenario_uncertainty_insufficient_coverage(db: Session) -> list[Step]:
+    steps: list[Step] = []
+    customer = _register_demo_customer(
+        db,
+        code="C-902",
+        name="新装有限历史户",
+        region="高新区",
+        meter_no="M902-01",
+        capacity_kw=1500.0,
+        day_kwh=lambda _day, slot: 30.0 + (slot % 8),
+        first_day=date(2025, 8, 16),
+        last_day=date(2025, 8, 20),
+    )
+    steps.append(
+        _step("登记仅有 5 天计量历史的新客户", True, {"customer_id": customer.id, "days": 5})
+    )
+    event = _event(db, "DR-20250820")
+    run = orchestrator.create_run(
+        db, actor="planner", period_month=DEMO_PERIOD, strategy="initial", event_id=event.id
+    )
+    baseline = _baseline_node(db, run.id, customer.id, event.id)
+    steps.append(
+        _step(
+            "基线可算（4 天合格样本 ≥3）",
+            baseline is not None and baseline.status == "success" and (baseline.output or {}).get("sample_days") == 4,
+            {"sample_days": (baseline.output or {}).get("sample_days") if baseline else None},
+        )
+    )
+    report = _report_for(db, run.id, customer.id, event.id)
+    detail = report.report or {}
+    steps.append(
+        _step(
+            "伪活动日残差 <5 → 报告 unavailable",
+            report.status == "unavailable"
+            and "qualified_samples_insufficient" in detail.get("unavailable_reasons", []),
+            {"status": report.status, "pseudo_days": detail.get("samples", {}).get("pseudo_days")},
+        )
+    )
+    steps.append(
+        _step("不确定度缺失不阻断运行", run.status == PASS, {"run_status": run.status})
+    )
+    result = orchestrator.publish_run(db, run.id, "approver", "覆盖不足场景：区间缺失不影响出账")
+    steps.append(
+        _step(
+            "账本仍可发布（不确定度只报告不设卡）",
+            len(result["ledger_entry_ids"]) == run.target_windows,
+            {"ledger_entries": len(result["ledger_entry_ids"])},
+        )
+    )
+    return steps
+
+
+def scenario_uncertainty_event_contamination(db: Session) -> list[Step]:
+    steps: list[Step] = []
+    db.add(
+        models.Event(
+            code="DR-20250818",
+            name="联调追加活动（夹杂在回看窗口）",
+            event_date=date(2025, 8, 18),
+            start_time=time(18, 0),
+            end_time=time(19, 0),
+            price_per_kwh=3.0,
+            period_month=DEMO_PERIOD,
+        )
+    )
+    db.commit()
+    steps.append(_step("在 8/20 回看窗口内登记新活动日 8/18", True, {"event_date": "2025-08-18"}))
+    event = _event(db, "DR-20250820")
+    run = orchestrator.create_run(
+        db, actor="planner", period_month=DEMO_PERIOD, strategy="initial", event_id=event.id
+    )
+    customer = db.scalars(select(models.Customer).where(models.Customer.code == "C-001")).one()
+    baseline = _baseline_node(db, run.id, customer.id, event.id)
+    elig = {row["day"]: row for row in (baseline.output or {}).get("sample_eligibility", [])}
+    row = elig.get("2025-08-18")
+    steps.append(
+        _step(
+            "基线样本以 event_day 理由排除夹杂活动日",
+            bool(row) and not row["used"] and "event_day" in row["reasons"],
+            row,
+        )
+    )
+    report = _report_for(db, run.id, customer.id, event.id)
+    calib = {r["day"]: r for r in (report.report or {}).get("samples", {}).get("eligibility", [])}
+    calib_row = calib.get("2025-08-18") or {}
+    steps.append(
+        _step(
+            "伪活动日序列排除该活动日",
+            not calib_row.get("eligible")
+            and "event_day" in calib_row.get("reasons", [])
+            and "pseudo" not in calib_row,
+            {"eligible": calib_row.get("eligible"), "reasons": calib_row.get("reasons")},
+        )
+    )
+    event_days = {e.event_date for e in db.scalars(select(models.Event)).all()}
+    labels_ok = all(
+        date.fromisoformat(r["day"]) not in event_days for r in _pseudo_rows(report)
+    )
+    steps.append(
+        _step(
+            "全部伪活动日残差均来自非活动日（实际活动日负荷不作误差标签）",
+            labels_ok,
+            {"pseudo_days": len(_pseudo_rows(report)), "event_days": sorted(d.isoformat() for d in event_days)},
+        )
+    )
+    return steps
+
+
 SCENARIOS: dict[str, Callable[[Session], list[Step]]] = {
     "baseline_shortfall": scenario_baseline_shortfall,
     "concurrency_claim": scenario_concurrency_claim,
     "late_batch_targeted": scenario_late_batch_targeted,
     "late_contract_adjustment": scenario_late_contract_adjustment,
     "rule_revision_full_period": scenario_rule_revision_full_period,
+    "uncertainty_calibration": scenario_uncertainty_calibration,
+    "uncertainty_flat_load": scenario_uncertainty_flat_load,
+    "uncertainty_holiday_exclusion": scenario_uncertainty_holiday_exclusion,
+    "uncertainty_missing_weather": scenario_uncertainty_missing_weather,
+    "uncertainty_insufficient_coverage": scenario_uncertainty_insufficient_coverage,
+    "uncertainty_event_contamination": scenario_uncertainty_event_contamination,
 }
 
 

@@ -120,6 +120,7 @@ export const STRATEGY_LABEL = {
 export const NODE_LABEL = {
   ingest: '补数',
   baseline: '基线',
+  uncertainty: '不确定度',
   response: '响应电量',
   settlement: '结算',
 }

@@ -186,6 +186,90 @@ def _to_date(value) -> object:
     return date.fromisoformat(str(value))
 
 
+def add_weather_daily(db: Session, payload: dict, actor: str) -> models.WeatherDaily:
+    """Append a new version of one region/day weather observation."""
+    region = (payload.get("region") or "").strip()
+    if not region:
+        raise RegistryError("region 不能为空")
+    day = _to_date(payload["day"])
+    avg_temp = payload.get("avg_temp_c")
+    if avg_temp is None:
+        raise RegistryError("avg_temp_c 不能为空")
+    latest = db.scalars(
+        select(models.WeatherDaily)
+        .where(models.WeatherDaily.region == region, models.WeatherDaily.day == day)
+        .order_by(models.WeatherDaily.version.desc())
+        .limit(1)
+    ).first()
+    avg_temp = float(avg_temp)
+    max_temp = payload.get("max_temp_c")
+    max_temp = float(max_temp) if max_temp is not None else None
+    if (
+        latest
+        and float(latest.avg_temp_c) == avg_temp
+        and (latest.max_temp_c is None and max_temp is None or latest.max_temp_c is not None and max_temp is not None and float(latest.max_temp_c) == max_temp)
+    ):
+        raise RegistryError(f"重复气象数据：与现有版本 v{latest.version} 一致，未登记", 409)
+    row = models.WeatherDaily(
+        region=region,
+        day=day,
+        version=(latest.version + 1) if latest else 1,
+        avg_temp_c=avg_temp,
+        max_temp_c=max_temp,
+        source_note=payload.get("source_note", ""),
+        created_by=actor,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def add_holiday(db: Session, payload: dict, actor: str) -> models.Holiday:
+    day = _to_date(payload["day"])
+    name = (payload.get("name") or "").strip()
+    if not name:
+        raise RegistryError("节假日名称不能为空")
+    existing = db.scalars(select(models.Holiday).where(models.Holiday.day == day)).first()
+    if existing:
+        raise RegistryError(f"{day.isoformat()} 已登记为节假日（{existing.name}）", 409)
+    row = models.Holiday(day=day, name=name, created_by=actor)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def add_outage_day(db: Session, payload: dict, actor: str) -> models.OutageDay:
+    customer_id = int(payload["customer_id"])
+    if db.get(models.Customer, customer_id) is None:
+        raise RegistryError("客户不存在", 404)
+    day = _to_date(payload["day"])
+    kind = (payload.get("kind") or "").strip()
+    if kind not in {"outage", "curtailment"}:
+        raise RegistryError("kind 必须是 outage（停电）或 curtailment（限电）")
+    existing = db.scalars(
+        select(models.OutageDay).where(
+            models.OutageDay.customer_id == customer_id,
+            models.OutageDay.day == day,
+            models.OutageDay.kind == kind,
+        )
+    ).first()
+    if existing:
+        raise RegistryError("该客户当日已登记同类停电/限电记录", 409)
+    row = models.OutageDay(
+        customer_id=customer_id,
+        day=day,
+        kind=kind,
+        note=payload.get("note", ""),
+        created_by=actor,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
 def batch_fingerprint(rows: list[models.MeterInterval]) -> str:
     return hashlib.sha256(
         ";".join(f"{r.ts.isoformat()}|{float(r.kwh):.3f}" for r in rows).encode()

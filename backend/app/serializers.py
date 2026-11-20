@@ -189,3 +189,44 @@ def compare_runs(db: Session, left_run_id: int, right_run_id: int) -> dict:
         "total_delta": round(sum(r["delta_amount"] or 0 for r in rows), 2),
         "rows": rows,
     }
+
+
+def uncertainty_brief(r: models.UncertaintyReport, db: Session | None = None) -> dict:
+    customer = db.get(models.Customer, r.customer_id) if db else None
+    event = db.get(models.Event, r.event_id) if db else None
+    run = db.get(models.Run, r.run_id) if db else None
+    report = r.report or {}
+    interval = report.get("interval") or {}
+    samples = report.get("samples") or {}
+    weekday_cov = samples.get("weekday_coverage") or {}
+    weather_cov = samples.get("weather_coverage") or {}
+    return {
+        "id": r.id,
+        "run_id": r.run_id,
+        "run_code": run.run_code if run else None,
+        "run_version": run.version if run else None,
+        "run_status": run.status if run else None,
+        "customer_id": r.customer_id,
+        "customer_code": customer.code if customer else None,
+        "customer_name": customer.name if customer else None,
+        "event_id": r.event_id,
+        "event_code": event.code if event else None,
+        "event_date": event.event_date.isoformat() if event else None,
+        "period_month": event.period_month if event else None,
+        "status": r.status,
+        "primary_method": r.primary_method,
+        "level": float(r.level),
+        "baseline_kwh": float(r.baseline_kwh) if r.baseline_kwh is not None else None,
+        "lower_kwh": float(r.lower_kwh) if r.lower_kwh is not None else None,
+        "upper_kwh": float(r.upper_kwh) if r.upper_kwh is not None else None,
+        "half_width_kwh": float(r.half_width_kwh) if r.half_width_kwh is not None else None,
+        "relative_width": interval.get("relative_width"),
+        "qualified_days": r.qualified_days,
+        "pseudo_days": samples.get("pseudo_days"),
+        "weekday_covered": weekday_cov.get("event_weekday_in_samples"),
+        "weather_status": weather_cov.get("status"),
+        "degraded_reasons": report.get("degraded_reasons", []),
+        "unavailable_reasons": report.get("unavailable_reasons", []),
+        "reused_from_report_id": r.reused_from_report_id,
+        "created_at": serialize_dt(r.created_at),
+    }

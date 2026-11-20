@@ -529,7 +529,9 @@ def _latest_successful_window(
                 models.Node.event_id == event_id,
             )
         ).all()
-        if len(nodes) == 4 and all(n.status == PASS for n in nodes):
+        by_type = {n.node_type: n for n in nodes}
+        required = ("ingest", "baseline", "response", "settlement")
+        if all(t in by_type and by_type[t].status == PASS for t in required):
             return run, window
     return None, None
 
@@ -550,6 +552,8 @@ def _execute(
     reused_count = 0
     rule_cache: dict[int, models.BaselineRuleVersion | None] = {}
     contract_cache: dict[tuple[int, int], models.ContractVersion | None] = {}
+    # Shared eligibility/weather/history cache for the whole run (one cut-off).
+    analysis_cache: dict = {}
 
     for event, customer in scope:
         if event.id not in rule_cache:
@@ -574,7 +578,8 @@ def _execute(
                 reuse = False
         if not reuse:
             outcome = engine.compute_window(
-                db, run, customer, event, rule, contract, meter_map.get(customer.id, [])
+                db, run, customer, event, rule, contract, meter_map.get(customer.id, []),
+                extras=analysis_cache,
             )
             computed_count += 1
         window_status = PASS if outcome.status == PASS else REVIEW

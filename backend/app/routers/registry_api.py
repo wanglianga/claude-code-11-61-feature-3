@@ -11,7 +11,17 @@ from sqlalchemy.orm import Session
 from .. import models, serializers
 from ..db import get_db
 from ..deps import audit, current_user, require_planner
-from ..schemas import BatchIn, ContractIn, LoginRequest, RuleIn, RuleValidateIn, TokenResponse
+from ..schemas import (
+    BatchIn,
+    ContractIn,
+    HolidayIn,
+    LoginRequest,
+    OutageIn,
+    RuleIn,
+    RuleValidateIn,
+    TokenResponse,
+    WeatherDailyIn,
+)
 from ..security import create_token, verify_password
 from ..services import registry, snapshot
 from ..services.orchestrator import find_affected_windows
@@ -467,6 +477,113 @@ def create_contract(body: ContractIn, db: Session = Depends(get_db), user=Depend
     audit(db, user.username, "contract.create", "contract", contract.id, {"version": contract.version})
     db.commit()
     return {"id": contract.id, "customer_id": contract.customer_id, "version": contract.version}
+
+
+# ---------------------------- weather / holidays / outages ----------------------------
+@router.get("/weather/daily", tags=["registry"])
+def list_weather(
+    region: str | None = None,
+    day_from: str | None = None,
+    day_to: str | None = None,
+    limit: int = Query(default=200, le=1000),
+    db: Session = Depends(get_db),
+    _user=Depends(current_user),
+):
+    stmt = select(models.WeatherDaily).order_by(models.WeatherDaily.region, models.WeatherDaily.day.desc())
+    if region:
+        stmt = stmt.where(models.WeatherDaily.region == region)
+    if day_from:
+        stmt = stmt.where(models.WeatherDaily.day >= day_from)
+    if day_to:
+        stmt = stmt.where(models.WeatherDaily.day <= day_to)
+    rows = db.scalars(stmt.limit(limit)).all()
+    return [
+        {
+            "id": w.id,
+            "region": w.region,
+            "day": w.day.isoformat(),
+            "version": w.version,
+            "avg_temp_c": float(w.avg_temp_c),
+            "max_temp_c": float(w.max_temp_c) if w.max_temp_c is not None else None,
+            "source_note": w.source_note,
+            "created_by": w.created_by,
+            "created_at": serialize_dt(w.created_at),
+        }
+        for w in rows
+    ]
+
+
+@router.post("/weather/daily", tags=["registry"], status_code=201)
+def create_weather(body: WeatherDailyIn, db: Session = Depends(get_db), user=Depends(require_planner)):
+    try:
+        row = registry.add_weather_daily(db, body.model_dump(), user.username)
+    except registry.RegistryError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    audit(db, user.username, "weather.create", "weather_daily", row.id, {"region": row.region, "day": row.day.isoformat()})
+    db.commit()
+    return {"id": row.id, "region": row.region, "day": row.day.isoformat(), "version": row.version}
+
+
+@router.get("/holidays", tags=["registry"])
+def list_holidays(db: Session = Depends(get_db), _user=Depends(current_user)):
+    rows = db.scalars(select(models.Holiday).order_by(models.Holiday.day)).all()
+    return [
+        {
+            "id": h.id,
+            "day": h.day.isoformat(),
+            "name": h.name,
+            "created_by": h.created_by,
+            "created_at": serialize_dt(h.created_at),
+        }
+        for h in rows
+    ]
+
+
+@router.post("/holidays", tags=["registry"], status_code=201)
+def create_holiday(body: HolidayIn, db: Session = Depends(get_db), user=Depends(require_planner)):
+    try:
+        row = registry.add_holiday(db, body.model_dump(), user.username)
+    except registry.RegistryError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    audit(db, user.username, "holiday.create", "holiday", row.id, {"day": row.day.isoformat()})
+    db.commit()
+    return {"id": row.id, "day": row.day.isoformat(), "name": row.name}
+
+
+@router.get("/outages", tags=["registry"])
+def list_outages(customer_id: int | None = None, db: Session = Depends(get_db), _user=Depends(current_user)):
+    stmt = (
+        select(models.OutageDay, models.Customer)
+        .join(models.Customer, models.Customer.id == models.OutageDay.customer_id)
+        .order_by(models.OutageDay.day.desc())
+    )
+    if customer_id:
+        stmt = stmt.where(models.OutageDay.customer_id == customer_id)
+    return [
+        {
+            "id": o.id,
+            "customer_id": o.customer_id,
+            "customer_code": c.code,
+            "customer_name": c.name,
+            "day": o.day.isoformat(),
+            "kind": o.kind,
+            "note": o.note,
+            "created_by": o.created_by,
+            "created_at": serialize_dt(o.created_at),
+        }
+        for o, c in db.execute(stmt).all()
+    ]
+
+
+@router.post("/outages", tags=["registry"], status_code=201)
+def create_outage(body: OutageIn, db: Session = Depends(get_db), user=Depends(require_planner)):
+    try:
+        row = registry.add_outage_day(db, body.model_dump(), user.username)
+    except registry.RegistryError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    audit(db, user.username, "outage.create", "outage_day", row.id, {"customer_id": row.customer_id, "day": row.day.isoformat()})
+    db.commit()
+    return {"id": row.id, "customer_id": row.customer_id, "day": row.day.isoformat(), "kind": row.kind}
 
 
 # ---------------------------- lineage ----------------------------

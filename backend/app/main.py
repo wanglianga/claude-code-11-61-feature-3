@@ -10,16 +10,17 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from .db import SessionLocal, init_db
-from .routers import demo_api, registry_api, runs_api
+from .routers import demo_api, registry_api, runs_api, uncertainty_api
 from .services.orchestrator import OrchestrationError
 
 log = logging.getLogger("drs")
 
 OPENAPI_TAGS = [
     {"name": "auth", "description": "登录与当前用户"},
-    {"name": "registry", "description": "来源登记：批次、基线规则版本、签约版本、客户与活动"},
+    {"name": "registry", "description": "来源登记：批次、基线规则版本、签约版本、气象、节假日、停电/限电、客户与活动"},
     {"name": "lineage", "description": "血缘与影响面：从变更来源追踪到客户/活动窗口"},
     {"name": "runs", "description": "运行编排：首次运行、定向重算、整期不可变重跑"},
+    {"name": "uncertainty", "description": "基线不确定度：伪活动日残差、预测区间、覆盖与校准诊断"},
     {"name": "publish", "description": "账本发布（仅接收完整成功的运行）"},
     {"name": "ledger", "description": "已发布账本、付款凭证与调整凭证"},
     {"name": "adjustments", "description": "差额调整与从调整追溯到来源"},
@@ -72,6 +73,7 @@ app.add_middleware(
 
 app.include_router(registry_api.router, prefix="/api")
 app.include_router(runs_api.router, prefix="/api")
+app.include_router(uncertainty_api.router, prefix="/api")
 app.include_router(demo_api.router, prefix="/api/demo")
 
 

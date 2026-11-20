@@ -81,6 +81,61 @@ DEMO_SCENARIOS = [
             "对比两个版本运行，逐窗口核对差异与总差额",
         ],
     },
+    {
+        "key": "uncertainty_calibration",
+        "title": "基线不确定度：伪活动日残差与双方法区间校准",
+        "steps": [
+            "整期运行后每个窗口生成不确定度报告（每窗口 5 节点）",
+            "校验伪活动日残差全部来自非活动日，且目标日及泄漏窗口被排除",
+            "留出法与连续日期块重采样均产出预测区间，宽度来源分解齐全",
+            "区间包含基线值、相对宽度合理，报告引用同一锁定规则与输入版本",
+        ],
+    },
+    {
+        "key": "uncertainty_flat_load",
+        "title": "平稳负荷 → 伪活动日残差近零、区间收窄",
+        "steps": [
+            "登记负荷恒定的示范客户与连续历史批次",
+            "运行后读取该客户不确定度报告",
+            "校验残差≈0、区间半宽≈0、状态 ok",
+        ],
+    },
+    {
+        "key": "uncertainty_holiday_exclusion",
+        "title": "节假日 → 样本资格排除并保留排除理由",
+        "steps": [
+            "在回看窗口内登记新节假日",
+            "重跑后校验该日以 holiday 理由排除",
+            "基线样本与伪活动日均不含该日",
+        ],
+    },
+    {
+        "key": "uncertainty_missing_weather",
+        "title": "天气缺项 → 覆盖诊断降级但区间仍可估计",
+        "steps": [
+            "云岭工业区（C-003）种子数据无气象记录",
+            "报告天气覆盖状态为 missing、覆盖因子放宽",
+            "状态 degraded 而非 unavailable，区间仍正常产出",
+        ],
+    },
+    {
+        "key": "uncertainty_insufficient_coverage",
+        "title": "覆盖不足 → 无法估计但不阻断结算",
+        "steps": [
+            "登记仅有 4 天计量历史的新客户",
+            "基线可算（4≥3）但伪活动日残差 <5 → 报告 unavailable",
+            "运行仍成功、账本可发布（不确定度只报告不设卡）",
+        ],
+    },
+    {
+        "key": "uncertainty_event_contamination",
+        "title": "夹杂活动日 → 活动日排除且从不作误差标签",
+        "steps": [
+            "在 8/20 活动回看窗口内登记新活动日 8/18",
+            "8/18 以 event_day 理由排除，不进入基线样本与伪活动日",
+            "全部伪活动日残差均来自非活动日",
+        ],
+    },
 ]
 
 
@@ -195,6 +250,47 @@ def seed(db: Session) -> None:
         )
     db.flush()
 
+    # ---- 不确定度分析来源：气象（云岭工业区故意缺项）、节假日、停电/限电 ----
+    weather_regions = [region for _, _, region, _, _, _ in CUSTOMERS if region != "云岭工业区"]
+    weather_start = date(2025, 7, 20)
+    for region in dict.fromkeys(weather_regions):
+        for i in range((date(2025, 8, 31) - weather_start).days + 1):
+            day = weather_start + timedelta(days=i)
+            rng = random.Random(f"weather-{region}-{day.isoformat()}")
+            avg_temp = round(30.0 + 3.0 * math.sin(i / 8.0) + rng.uniform(-1.5, 1.5), 1)
+            db.add(
+                models.WeatherDaily(
+                    region=region,
+                    day=day,
+                    version=1,
+                    avg_temp_c=avg_temp,
+                    max_temp_c=round(avg_temp + 5.5, 1),
+                    source_note="虚构气象站日值（演示数据）",
+                    created_by="system",
+                    created_at=SEED_EPOCH - timedelta(days=2),
+                )
+            )
+    db.add(
+        models.Holiday(
+            day=date(2025, 8, 11),
+            name="全民健身示范假日（虚构数据）",
+            created_by="system",
+            created_at=SEED_EPOCH - timedelta(days=2),
+        )
+    )
+    c006 = next(c for c in customers if c.code == "C-006")
+    db.add(
+        models.OutageDay(
+            customer_id=c006.id,
+            day=date(2025, 8, 18),
+            kind="curtailment",
+            note="园区计划限电（虚构数据）",
+            created_by="system",
+            created_at=SEED_EPOCH - timedelta(days=2),
+        )
+    )
+    db.flush()
+
     base_of_customer = {c.id: c._base_kw for c in customers}  # type: ignore[attr-defined]
     event_days = {e[2]: e for e in EVENTS}
     start_day = date(2025, 7, 25)
@@ -272,6 +368,9 @@ def demo_state() -> dict:
             "customers": db.scalar(select(func.count()).select_from(models.Customer)) or 0,
             "events": db.scalar(select(func.count()).select_from(models.Event)) or 0,
             "batches": db.scalar(select(func.count()).select_from(models.MeterBatch)) or 0,
+            "weather_rows": db.scalar(select(func.count()).select_from(models.WeatherDaily)) or 0,
+            "holidays": db.scalar(select(func.count()).select_from(models.Holiday)) or 0,
+            "outage_days": db.scalar(select(func.count()).select_from(models.OutageDay)) or 0,
             "runs": db.scalar(select(func.count()).select_from(models.Run)) or 0,
             "ledger_entries": db.scalar(select(func.count()).select_from(models.LedgerEntry)) or 0,
             "adjustments": db.scalar(select(func.count()).select_from(models.Adjustment)) or 0,

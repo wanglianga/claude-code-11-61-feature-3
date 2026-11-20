@@ -49,6 +49,7 @@ const navItems = [
   { path: '/', label: '总览', icon: '▦' },
   { path: '/registry', label: '来源登记', icon: '▤' },
   { path: '/runs', label: '运行看板', icon: '⧉' },
+  { path: '/uncertainty', label: '基线不确定度', icon: '∿' },
   { path: '/diff', label: '差异与追溯', icon: '⇄' },
   { path: '/ledger', label: '账本与凭证', icon: '▣' },
   { path: '/adjustments', label: '调整台账', icon: '±' },

@@ -24,7 +24,8 @@ from ..utils import (
     money,
     number,
 )
-from . import snapshot
+from . import eligibility, snapshot
+from . import uncertainty as uncertainty_svc
 
 PASS = "success"
 REVIEW = "needs_review"
@@ -76,8 +77,9 @@ def compute_window(
     rule: models.BaselineRuleVersion | None,
     contract: models.ContractVersion | None,
     meter_points: list[models.MeterPoint],
+    extras: dict | None = None,
 ) -> WindowOutcome:
-    """Compute one customer/event window and persist its four nodes."""
+    """Compute one customer/event window and persist its nodes."""
     cutoff = aware_utc(run.cutoff_at)
     intervals = event_intervals(event.event_date, event.start_time, event.end_time)
     if not intervals:
@@ -86,6 +88,18 @@ def compute_window(
     win_end = intervals[-1] + timedelta(minutes=15)
 
     nodes: dict[str, models.Node] = {}
+
+    # Shared per-run caches: reference data and per-customer meter history are
+    # loaded once and reused by the baseline gate and the uncertainty analysis,
+    # so both read exactly the same locked inputs at the run's cut-off.
+    cache = extras if extras is not None else {}
+    if ("ref",) not in cache:
+        cache[("ref",)] = eligibility.RefData.load(db, cutoff)
+    ref_data: eligibility.RefData = cache[("ref",)]
+    hist_key = ("hist", customer.id)
+    if hist_key not in cache:
+        cache[hist_key] = eligibility.CustomerHistory.load(db, meter_points, cutoff)
+    history: eligibility.CustomerHistory = cache[hist_key]
 
     # ---------- 1. 补数 (ingest) ----------
     meter_ids = [m.id for m in meter_points]
@@ -141,6 +155,7 @@ def compute_window(
     baseline_total = 0.0
     sample_days = 0
     daily_baselines: list[dict] = []
+    sample_eligibility: list[dict] = []
     per_interval_baseline: dict[datetime, float] = {}
 
     if rule is None:
@@ -149,57 +164,45 @@ def compute_window(
     else:
         lookback = max(0, int(rule.lookback_days))
         day_step = timedelta(days=1)
+        lookback_days = [event.event_date - day_step * offset for offset in range(1, lookback + 1)]
+        elig_map = eligibility.eligibility_map(
+            lookback_days,
+            customer=customer,
+            history=history,
+            ref=ref_data,
+            start=event.start_time,
+            end=event.end_time,
+        )
         samples: list[list[float]] = []
-        sample_batches: list[dict] = []
-        for offset in range(1, lookback + 1):
-            day = event.event_date - day_step * offset
-            day_intervals = event_intervals(day, event.start_time, event.end_time)
-            day_start, day_end = day_intervals[0], day_intervals[-1] + timedelta(minutes=15)
-            day_batches = snapshot.select_batches(db, meter_ids, day_start, day_end, cutoff)
-            if len(day_batches) != len(meter_points):
-                continue
-            rows = snapshot.interval_rows(db, [b.id for b in day_batches.values()], day_start, day_end)
-            interval_totals: list[float] = []
-            complete = True
-            for ts in day_intervals:
-                total = 0.0
-                for b in day_batches.values():
-                    per_ts = {aware_utc(r.ts): float(r.kwh) for r in rows.get(b.id, [])}
-                    value = per_ts.get(ts)
-                    if value is None:
-                        complete = False
-                        break
-                    total += value
-                if not complete:
-                    break
-                interval_totals.append(total)
-            if not complete:
-                continue
-            totals = interval_totals
-            day_total = sum(totals)
-            if day_total <= 0:
-                continue
-            samples.append(totals)
-            sample_batches.extend(
+        for day in lookback_days:
+            elig = elig_map[day]
+            used = elig.eligible
+            sample_eligibility.append(
                 {
-                    "batch_id": b.id,
-                    "version": b.version,
-                    "measured_day": day.isoformat(),
+                    "day": day.isoformat(),
+                    "eligible": elig.eligible,
+                    "used": used,
+                    "reasons": elig.reasons,
+                    "reason_labels": elig.reason_labels,
+                    "day_total_kwh": elig.day_total_kwh,
+                    "batch_ids": list(elig.window.batch_ids) if elig.window else [],
                 }
-                for b in day_batches.values()
             )
+            if not used:
+                continue
+            samples.append(elig.window.totals)
             daily_baselines.append(
                 {
                     "measured_day": day.isoformat(),
-                    "day_total_kwh": number(day_total),
-                    "batch_ids": [b.id for b in day_batches.values()],
+                    "day_total_kwh": number(elig.window.total_kwh),
+                    "batch_ids": list(elig.window.batch_ids),
                 }
             )
         sample_days = len(samples)
         if sample_days < int(rule.min_sample_days):
             baseline_ok = False
             baseline_reason = (
-                f"基线样本不足：可用 {sample_days} 天，规则要求 ≥{rule.min_sample_days} 天（回看 {lookback} 天）"
+                f"基线样本不足：合格 {sample_days} 天，规则要求 ≥{rule.min_sample_days} 天（回看 {lookback} 天）"
             )
         else:
             factor = Decimal(str(rule.adjustment_factor or 1))
@@ -218,6 +221,7 @@ def compute_window(
         "adjustment_factor": float(rule.adjustment_factor) if rule else None,
         "sample_days": sample_days,
         "daily_sources": daily_baselines,
+        "sample_eligibility": sample_eligibility,
         "baseline_kwh": number(baseline_total) if baseline_ok else None,
         "per_interval": [
             {"ts": ts.isoformat(), "kwh": per_interval_baseline.get(ts)} for ts in intervals
@@ -236,6 +240,37 @@ def compute_window(
     db.flush()
     nodes["baseline"] = baseline
     db.add(_source(baseline, "rule", rule.id, **rule_meta) if rule else _source(baseline, "rule", 0, missing=True))
+
+    # ---------- 2b. 基线不确定度 (uncertainty, 从不阻断结算) ----------
+    unc = uncertainty_svc.analyze_window(
+        db,
+        run=run,
+        customer=customer,
+        event=event,
+        rule=rule,
+        meter_points=meter_points,
+        cutoff=cutoff,
+        baseline_kwh=baseline_total if baseline_ok else None,
+        baseline_sample_days=sample_days,
+        cache=cache,
+    )
+    unc_node = _node(run.id, customer.id, event.id, "uncertainty", PASS, {}, None)
+    db.add(unc_node)
+    db.flush()
+    nodes["uncertainty"] = unc_node
+    for source_type, ref_id, meta in unc.sources:
+        db.add(_source(unc_node, source_type, ref_id, **meta))
+    report_row = models.UncertaintyReport(
+        run_id=run.id,
+        customer_id=customer.id,
+        event_id=event.id,
+        node_id=unc_node.id,
+        **unc.row,
+    )
+    db.add(report_row)
+    db.flush()
+    unc_node.output = {**unc.summary, "report_id": report_row.id}
+
     if not baseline_ok:
         return _block_downstream(db, run, customer, event, nodes, baseline_reason, baseline)
 
@@ -363,9 +398,11 @@ def _block_downstream(
     reason: str | None,
     upstream: models.Node,
 ) -> WindowOutcome:
-    order = ["ingest", "baseline", "response", "settlement"]
+    order = ["ingest", "baseline", "uncertainty", "response", "settlement"]
     start = order.index(upstream.node_type) + 1
     for node_type in order[start:]:
+        if node_type in nodes:
+            continue
         blocked = _node(
             run.id,
             customer.id,
@@ -391,6 +428,18 @@ def _wire_edges(db: Session, run_id: int, nodes: dict[str, models.Node]) -> None
                 from_node_id=upstream.id,
                 to_node_id=downstream.id,
                 relation=f"{upstream.node_type}->{downstream.node_type}",
+            )
+        )
+    # Uncertainty is a side branch of the baseline, never upstream of settlement.
+    baseline = nodes.get("baseline")
+    unc = nodes.get("uncertainty")
+    if baseline is not None and unc is not None:
+        db.add(
+            models.LineageEdge(
+                run_id=run_id,
+                from_node_id=baseline.id,
+                to_node_id=unc.id,
+                relation="baseline->uncertainty",
             )
         )
 
@@ -425,7 +474,8 @@ def clone_window_from(
         raise ValueError("来源窗口节点不完整或未全部成功，不可复用")
 
     new_nodes: dict[str, models.Node] = {}
-    for node_type in required:
+    clone_types = [t for t in ("ingest", "baseline", "uncertainty", "response", "settlement") if t in by_type]
+    for node_type in clone_types:
         src = by_type[node_type]
         clone = models.Node(
             run_id=run.id,
@@ -451,6 +501,36 @@ def clone_window_from(
                     meta=dict(source.meta or {}),
                 )
             )
+    # Clone the uncertainty report so the reused window keeps its interval.
+    if "uncertainty" in new_nodes:
+        src_unc = by_type["uncertainty"]
+        src_report = db.scalars(
+            select(models.UncertaintyReport).where(models.UncertaintyReport.node_id == src_unc.id)
+        ).first()
+        if src_report is not None:
+            new_report = models.UncertaintyReport(
+                run_id=run.id,
+                customer_id=customer.id,
+                event_id=event.id,
+                node_id=new_nodes["uncertainty"].id,
+                status=src_report.status,
+                primary_method=src_report.primary_method,
+                level=src_report.level,
+                baseline_kwh=src_report.baseline_kwh,
+                lower_kwh=src_report.lower_kwh,
+                upper_kwh=src_report.upper_kwh,
+                half_width_kwh=src_report.half_width_kwh,
+                qualified_days=src_report.qualified_days,
+                report=dict(src_report.report or {}),
+                input_refs=dict(src_report.input_refs or {}),
+                reused_from_report_id=src_report.id,
+            )
+            db.add(new_report)
+            db.flush()
+            new_nodes["uncertainty"].output = {
+                **new_nodes["uncertainty"].output,
+                "report_id": new_report.id,
+            }
     for edge in db.scalars(select(models.LineageEdge).where(models.LineageEdge.run_id == base_run.id)):
         from_node = next((n for n in src_nodes if n.id == edge.from_node_id), None)
         to_node = next((n for n in src_nodes if n.id == edge.to_node_id), None)
@@ -484,5 +564,6 @@ def recompute_cleanup(db: Session, run_id: int) -> None:
         db.execute(delete(models.LineageEdge).where(models.LineageEdge.run_id == run_id))
         db.execute(delete(models.NodeSource).where(models.NodeSource.node_id.in_(node_ids)))
         db.execute(delete(models.Node).where(models.Node.run_id == run_id))
+    db.execute(delete(models.UncertaintyReport).where(models.UncertaintyReport.run_id == run_id))
     db.execute(delete(models.RunWindow).where(models.RunWindow.run_id == run_id))
     db.flush()

@@ -53,6 +53,10 @@ def get_run(run_id: int, db: Session = Depends(get_db), _user=Depends(current_us
     payload["contract_snapshot"] = run.contract_snapshot or {}
     payload["scope_event_ids"] = run.scope_event_ids or []
     payload["windows"] = []
+    unc_reports = db.scalars(
+        select(models.UncertaintyReport).where(models.UncertaintyReport.run_id == run_id)
+    ).all()
+    unc_map = {(r.customer_id, r.event_id): r for r in unc_reports}
     for w in windows:
         customer = db.get(models.Customer, w.customer_id)
         event = db.get(models.Event, w.event_id)
@@ -72,6 +76,7 @@ def get_run(run_id: int, db: Session = Depends(get_db), _user=Depends(current_us
                 models.Node.status == "needs_review",
             )
         ).first()
+        unc = unc_map.get((w.customer_id, w.event_id))
         payload["windows"].append(
             {
                 "customer_id": w.customer_id,
@@ -87,6 +92,16 @@ def get_run(run_id: int, db: Session = Depends(get_db), _user=Depends(current_us
                 else None,
                 "review_node": review.node_type if review else None,
                 "reason": review.reason if review else None,
+                "uncertainty": (
+                    {
+                        "report_id": unc.id,
+                        "status": unc.status,
+                        "half_width_kwh": float(unc.half_width_kwh) if unc.half_width_kwh is not None else None,
+                        "relative_width": (unc.report or {}).get("interval", {}).get("relative_width"),
+                    }
+                    if unc
+                    else None
+                ),
             }
         )
     ledger_rows = db.scalars(select(models.LedgerEntry).where(models.LedgerEntry.run_id == run_id)).all()

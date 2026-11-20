@@ -73,7 +73,7 @@
           </select>
         </div>
         <table>
-          <thead><tr><th>客户</th><th>活动</th><th>状态</th><th class="num">响应电量</th><th class="num">金额</th><th>待核原因</th><th></th></tr></thead>
+          <thead><tr><th>客户</th><th>活动</th><th>状态</th><th class="num">响应电量</th><th class="num">金额</th><th>不确定度</th><th>待核原因</th><th></th></tr></thead>
           <tbody>
             <tr v-for="w in filteredWindows" :key="w.customer_id + '-' + w.event_id">
               <td><strong>{{ w.customer_code }}</strong><div class="small muted">{{ w.customer_name }}</div></td>
@@ -84,8 +84,18 @@
               </td>
               <td class="num">{{ w.response_kwh ?? '—' }}</td>
               <td class="num">{{ w.amount != null ? fmt.money(w.amount) : '—' }}</td>
+              <td>
+                <template v-if="w.uncertainty">
+                  <span class="badge" :class="UNC_BADGE[w.uncertainty.status] || 'gray'">{{ UNC_LABEL[w.uncertainty.status] || w.uncertainty.status }}</span>
+                  <span v-if="w.uncertainty.relative_width != null" class="small muted"> ±{{ (w.uncertainty.relative_width * 100).toFixed(1) }}%</span>
+                </template>
+                <span v-else class="muted">—</span>
+              </td>
               <td class="small" style="color:var(--warn)">{{ w.reason || '' }}</td>
-              <td><button class="btn small" @click="openLineage(w)">血缘</button></td>
+              <td>
+                <button class="btn small" @click="openLineage(w)">血缘</button>
+                <router-link v-if="w.uncertainty" class="btn small" style="margin-left:4px" to="/uncertainty">区间</router-link>
+              </td>
             </tr>
           </tbody>
         </table>
@@ -141,7 +151,9 @@ const message = ref(null)
 const windowFilter = ref('')
 const lineage = ref(null)
 
-const SOURCE_LABEL = { batch: '批次', rule: '规则', contract: '签约', event: '活动', node: '节点' }
+const SOURCE_LABEL = { batch: '批次', rule: '规则', contract: '签约', event: '活动', node: '节点', weather: '气象', holiday: '节假日', outage: '停/限电' }
+const UNC_LABEL = { ok: '充分', degraded: '降级', unavailable: '无法估计' }
+const UNC_BADGE = { ok: 'ok', degraded: 'warn', unavailable: 'danger' }
 
 const filteredWindows = computed(() => {
   const windows = run.value?.windows || []

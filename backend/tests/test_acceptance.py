@@ -36,7 +36,7 @@ def test_initial_run_freezes_snapshot_and_settles():
         run = orchestrator.create_run(db, actor="planner", period_month=PERIOD, strategy="initial")
         assert run.status == "success"
         assert run.target_windows == 18 and run.computed_windows == 18
-        assert run.node_count == 72
+        assert run.node_count == 90  # 18 窗口 × 5 节点（含 uncertainty 旁路）
         assert len(run.batch_snapshot) > 0
         assert run.rule_snapshot and run.contract_snapshot
         settlements = db.scalars(
@@ -102,7 +102,7 @@ def test_late_batch_targeted_reuses_and_adjusts():
                 models.Node.run_id == targeted.id, models.Node.reused_from_node_id.is_not(None)
             )
         ).all()
-        assert len(reused_nodes) == 4 * targeted.reused_windows
+        assert len(reused_nodes) == 5 * targeted.reused_windows  # 含 uncertainty 节点克隆
         # Reused nodes still carry the original batch lineage.
         sources = db.scalars(
             select(models.NodeSource).where(models.NodeSource.node_id.in_([n.id for n in reused_nodes]))

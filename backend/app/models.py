@@ -161,6 +161,61 @@ class MeterInterval(Base):
     quality: Mapped[str] = mapped_column(String(16), default="good")
 
 
+class WeatherDaily(Base):
+    """Daily weather observation per region, append-only like every other source.
+
+    A later version for the same (region, day) supersedes earlier ones; every
+    consumer resolves "latest version submitted before the run cut-off".
+    """
+
+    __tablename__ = "weather_daily"
+    __table_args__ = (
+        UniqueConstraint("region", "day", "version", name="uq_weather_region_day_version"),
+        Index("ix_weather_region_day", "region", "day"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    region: Mapped[str] = mapped_column(String(64))
+    day: Mapped[date] = mapped_column(Date)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    avg_temp_c: Mapped[float] = mapped_column(Numeric(5, 2))
+    max_temp_c: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
+    source_note: Mapped[str] = mapped_column(String(255), default="")
+    created_by: Mapped[str] = mapped_column(String(64), default="system")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Holiday(Base):
+    """Holiday calendar entry.  Append-only; consumers filter by created_at <= cutoff."""
+
+    __tablename__ = "holidays"
+    __table_args__ = (UniqueConstraint("day", name="uq_holiday_day"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    day: Mapped[date] = mapped_column(Date)
+    name: Mapped[str] = mapped_column(String(128))
+    created_by: Mapped[str] = mapped_column(String(64), default="system")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class OutageDay(Base):
+    """Planned outage / curtailment (停电/限电) day for one customer.  Append-only."""
+
+    __tablename__ = "outage_days"
+    __table_args__ = (
+        UniqueConstraint("customer_id", "day", "kind", name="uq_outage_customer_day_kind"),
+        Index("ix_outage_customer_day", "customer_id", "day"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id"), index=True)
+    day: Mapped[date] = mapped_column(Date)
+    kind: Mapped[str] = mapped_column(String(16))  # outage 停电 | curtailment 限电
+    note: Mapped[str] = mapped_column(String(255), default="")
+    created_by: Mapped[str] = mapped_column(String(64), default="system")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class Run(Base):
     __tablename__ = "runs"
     __table_args__ = (
@@ -340,6 +395,39 @@ class Adjustment(Base):
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     approved_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     adjustment_voucher_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class UncertaintyReport(Base):
+    """Baseline-uncertainty report for one customer/event window of a run.
+
+    The report is an *analysis artefact*: it never rewrites the baseline and
+    never claims actual curtailment.  It references the same locked rule and
+    input versions as the run it belongs to (see ``input_refs``).
+    """
+
+    __tablename__ = "uncertainty_reports"
+    __table_args__ = (
+        UniqueConstraint("run_id", "customer_id", "event_id", name="uq_uncertainty_window"),
+        Index("ix_uncertainty_run", "run_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("runs.id"), index=True)
+    customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id"))
+    event_id: Mapped[int] = mapped_column(ForeignKey("events.id"))
+    node_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("run_nodes.id"), nullable=True)
+    status: Mapped[str] = mapped_column(String(16))  # ok | degraded | unavailable
+    primary_method: Mapped[str] = mapped_column(String(24), default="holdout")
+    level: Mapped[float] = mapped_column(Numeric(4, 2), default=0.9)
+    baseline_kwh: Mapped[float | None] = mapped_column(Numeric(16, 3), nullable=True)
+    lower_kwh: Mapped[float | None] = mapped_column(Numeric(16, 3), nullable=True)
+    upper_kwh: Mapped[float | None] = mapped_column(Numeric(16, 3), nullable=True)
+    half_width_kwh: Mapped[float | None] = mapped_column(Numeric(16, 3), nullable=True)
+    qualified_days: Mapped[int] = mapped_column(Integer, default=0)
+    report: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    input_refs: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    reused_from_report_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class AuditLog(Base):

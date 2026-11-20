@@ -87,5 +87,25 @@ class RuleValidateIn(BaseModel):
     min_sample_days: int = 3
 
 
+class WeatherDailyIn(BaseModel):
+    region: str
+    day: date
+    avg_temp_c: float = Field(ge=-50, le=60)
+    max_temp_c: float | None = Field(default=None, ge=-50, le=60)
+    source_note: str = ""
+
+
+class HolidayIn(BaseModel):
+    day: date
+    name: str
+
+
+class OutageIn(BaseModel):
+    customer_id: int
+    day: date
+    kind: Literal["outage", "curtailment"] = Field(description="outage 停电 / curtailment 限电")
+    note: str = ""
+
+
 class DemoResetIn(BaseModel):
     confirm: bool = False
